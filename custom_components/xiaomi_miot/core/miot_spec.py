@@ -270,7 +270,7 @@ class MiotSpec(MiotSpecInstance):
         if not dat:
             try:
                 url = '/miot-spec-v2/instances?status=all'
-                dat = await MiotSpec.async_download_miot_spec(hass, url, tries=3, timeout=60)
+                dat = await MiotSpec.async_download_miot_spec(hass, url, tries=3, timeout=90)
                 if dat:
                     sdt = {
                         '_updated_time': now,
@@ -919,6 +919,12 @@ class MiotAction(MiotSpecInstance):
             or self.unique_name in lst \
             or self.unique_prop in lst \
             or self.full_name in lst
+
+    def in_properties(self):
+        properties = []
+        for pid in self.ins:
+            properties.append(self.service.properties.get(pid))
+        return properties
 
     def in_params_from_attrs(self, dat: dict, with_piid=True):
         pms = []

@@ -685,6 +685,8 @@ class MiioInfo(MiioInfoBase):
 
 
 class MiotDevice(MiotDeviceBase):
+    hass = None
+
     def get_properties_for_mapping(self, *, max_properties=12, did=None, mapping=None) -> list:
         if mapping is None:
             mapping = self.mapping
@@ -696,6 +698,17 @@ class MiotDevice(MiotDeviceBase):
             properties,
             property_getter='get_properties',
             max_properties=max_properties,
+        )
+
+    async def async_get_properties_for_mapping(self, *args, **kwargs) -> list:
+        if not self.hass:
+            return self.get_properties_for_mapping(*args, **kwargs)
+
+        return await self.hass.async_add_executor_job(
+            partial(
+                self.get_properties_for_mapping,
+                *args, **kwargs,
+            )
         )
 
 
@@ -1256,6 +1269,7 @@ class MiotEntity(MiioEntity):
             except ValueError as exc:
                 self.logger.warning('%s: Initializing with host %s failed: %s', host, self.name_model, exc)
             if device:
+                device.hass = self.hass
                 self._device = device
         return self._device
 
@@ -1413,13 +1427,10 @@ class MiotEntity(MiioEntity):
                             10, 9, 9, 9, 9, 9, 10, 10, 10, 10,
                         ]
                         max_properties = 10 if idx >= len(chunks) else chunks[idx]
-                    results = await self.hass.async_add_executor_job(
-                        partial(
-                            self._device.get_properties_for_mapping,
-                            max_properties=max_properties,
-                            did=self.miot_did,
-                            mapping=local_mapping,
-                        )
+                    results = await self._device.async_get_properties_for_mapping(
+                        max_properties=max_properties,
+                        did=self.miot_did,
+                        mapping=local_mapping,
                     )
                 self._local_state = True
             except (DeviceException, OSError) as exc:
@@ -1440,9 +1451,7 @@ class MiotEntity(MiioEntity):
             updater = 'cloud'
             try:
                 mic = self.xiaomi_cloud
-                results = await self.hass.async_add_executor_job(
-                    partial(mic.get_properties_for_mapping, self.miot_did, mapping)
-                )
+                results = await mic.async_get_properties_for_mapping(self.miot_did, mapping)
                 if self.custom_config_bool('check_lan'):
                     if self.miot_device:
                         await self.hass.async_add_executor_job(self.miot_device.info)
@@ -1533,13 +1542,13 @@ class MiotEntity(MiioEntity):
     async def async_update_for_main_entity(self):
         if self._miot_service:
             for d in [
-                'sensor', 'binary_sensor', 'switch', 'number',
-                'select', 'fan', 'cover', 'button', 'number_select',
+                'sensor', 'binary_sensor', 'switch', 'number', 'select',
+                'fan', 'cover', 'button', 'scanner', 'number_select',
             ]:
                 pls = self.custom_config_list(f'{d}_properties') or []
                 if pls:
                     self._update_sub_entities(pls, '*', domain=d)
-            for d in ['button', 'text']:
+            for d in ['button', 'text', 'select']:
                 als = self.custom_config_list(f'{d}_actions') or []
                 if als:
                     self._update_sub_entities(None, '*', domain=d, actions=als)
@@ -1788,7 +1797,7 @@ class MiotEntity(MiioEntity):
         if attrs:
             await self.async_update_attrs(attrs)
 
-    def get_properties(self, mapping, update_entity=False, throw=False, **kwargs):
+    async def async_get_properties(self, mapping, update_entity=False, throw=False, **kwargs):
         results = []
         if isinstance(mapping, list):
             new_mapping = {}
@@ -1805,9 +1814,9 @@ class MiotEntity(MiioEntity):
             return
         try:
             if self._local_state:
-                results = self.miot_device.get_properties_for_mapping(mapping=mapping)
+                results = await self.miot_device.async_get_properties_for_mapping(mapping=mapping)
             elif self.miot_cloud:
-                results = self.miot_cloud.get_properties_for_mapping(self.miot_did, mapping)
+                results = await self.miot_cloud.async_get_properties_for_mapping(self.miot_did, mapping)
         except (ValueError, DeviceException) as exc:
             self.logger.error(
                 '%s: Got exception while get properties: %s, mapping: %s, miio: %s',
@@ -1821,14 +1830,9 @@ class MiotEntity(MiioEntity):
         self.logger.info('%s: Get miot properties: %s', self.name_model, results)
 
         if attrs and update_entity:
-            self.update_attrs(attrs, update_subs=True)
+            await self.async_update_attrs(attrs, update_subs=True)
             self.schedule_update_ha_state()
         return attrs
-
-    async def async_get_properties(self, mapping, **kwargs):
-        return await self.hass.async_add_executor_job(
-            partial(self.get_properties, mapping, **kwargs)
-        )
 
     def set_property(self, field, value):
         if isinstance(field, MiotProperty):
@@ -2021,6 +2025,7 @@ class MiotEntity(MiioEntity):
         add_selects = self._add_entities.get('select')
         add_buttons = self._add_entities.get('button')
         add_texts = self._add_entities.get('text')
+        add_device_trackers = self._add_entities.get('device_tracker')
         exclude_services = self._state_attrs.get('exclude_miot_services') or []
         for s in sls:
             if s.name in exclude_services:
@@ -2081,6 +2086,10 @@ class MiotEntity(MiioEntity):
                         from .text import MiotTextActionSubEntity
                         self._subs[fnm] = MiotTextActionSubEntity(self, p, option=opt)
                         add_texts([self._subs[fnm]])
+                    elif add_selects and domain == 'select' and p.ins:
+                        from .select import MiotActionSelectSubEntity
+                        self._subs[fnm] = MiotActionSelectSubEntity(self, p, option=opt)
+                        add_selects([self._subs[fnm]])
                 elif add_buttons and domain == 'button' and (p.value_list or p.is_bool):
                     from .button import MiotButtonSubEntity
                     nls = []
@@ -2127,6 +2136,10 @@ class MiotEntity(MiioEntity):
                     from .select import MiotSelectSubEntity
                     self._subs[fnm] = MiotSelectSubEntity(self, p, option=opt)
                     add_selects([self._subs[fnm]], update_before_add=True)
+                elif add_device_trackers and domain == 'scanner' and (p.is_bool or p.is_integer):
+                    from .device_tracker import MiotScannerSubEntity
+                    self._subs[fnm] = MiotScannerSubEntity(self, p, option=opt)
+                    add_device_trackers([self._subs[fnm]], update_before_add=True)
                 if new and fnm in self._subs:
                     self._check_same_sub_entity(fnm, domain, add=1)
                     self.logger.debug('%s: Added sub entity %s: %s', self.name_model, domain, fnm)

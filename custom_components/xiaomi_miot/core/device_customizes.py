@@ -39,7 +39,9 @@ DEVICE_CUSTOMIZES = {
     'ainice.sensor_occupy.3b': {
         'main_miot_services': 'occupancy_sensor',
         'state_property': 'occupancy_sensor.current_occupied',
-        'interval_seconds': 10,
+        'interval_seconds': 30,
+        'chunk_properties': 7,
+        'parallel_updates': 1,
         'binary_sensor_properties': 'current_occupied,a_occupied,b_occupied,c_occupied,d_occupied,e_occupied',
         'sensor_properties': 'total_occupied,illumination',
         'switch_properties': 'radar_switch,count_switch',
@@ -69,6 +71,18 @@ DEVICE_CUSTOMIZES = {
     'ainice.sensor_occupy.3b:e_occupied': {
         'with_properties': 'e_someone_duration,e_noone_duration',
         'device_class': 'occupancy',
+    },
+    'ainice.sensor_occupy.bt': {
+        'main_miot_services': 'occupancy_sensor',
+        'interval_seconds': 10,
+        'parallel_updates': 1,
+        'switch_properties': 'indicator_switch,bt_pair_switch',
+        'select_properties': 'bt_power_level',
+        'scanner_properties': 'online_status',
+        'select_actions': 'send_magic_package',
+    },
+    'ainice.sensor_occupy.bt:online_status': {
+        'with_properties': 'online_duration,offline_duration,offline_interval,online_mode,bt_capture_mode,binding_info',
     },
     'ainice.sensor_occupy.pr': {
         'main_miot_services': 'occupancy_sensor',
@@ -730,6 +744,26 @@ DEVICE_CUSTOMIZES = {
         'switch_properties': 'flushing,small_flushing',
         'select_properties': 'work_mode,hip_water_gage,woman_water_gage,hip_nozzle_position,woman_nozzle_pos,'
                              'seat_temperature,wind_temperature,water_temperature,auto_mode',
+    },
+    'iot.plug.jdls1': {
+        'chunk_properties': 1,
+        'exclude_miot_services': 'indicator_light',
+        'exclude_miot_properties': 'power_consumption',
+        'sensor_attributes': 'power_cost_today,power_cost_month',
+        'stat_power_cost_type': 'stat_day_v3',
+        'stat_power_cost_key': '3.1',
+    },
+    'iot.plug.jdls1:power_cost_today': {
+        'value_ratio': 1,
+        'state_class': 'total_increasing',
+        'device_class': 'energy',
+        'unit_of_measurement': 'kWh',
+    },
+    'iot.plug.jdls1:power_cost_month': {
+        'value_ratio': 1,
+        'state_class': 'total_increasing',
+        'device_class': 'energy',
+        'unit_of_measurement': 'kWh',
     },
     'iot.switch.padw2p': {
         'sensor_properties': 'temperature,electric_power,electric_current,voltage',
@@ -1483,6 +1517,13 @@ DEVICE_CUSTOMIZES = {
         'number_properties': 'target_temperature,target_time,reservation_left_time,keep_warm_time',
         'button_actions': 'start_cook,pause,cancel_cooking,resume_cook',
     },
+    'xiaomi.fan.p51': {
+        'button_actions': 'turn_left,turn_right,toggle,toggle_mode,loop_gear',
+        'switch_properties': 'delay',
+        'select_properties': 'horizontal_swing_included_angle',
+        'number_properties': 'delay_time',
+        'percentage_property': 'prop.2.6',
+    },
     'xiaomi.heater.ma8': {
         'button_actions': 'toggle',
     },
@@ -1697,6 +1738,41 @@ DEVICE_CUSTOMIZES = {
         'brightness_for_on': 0,
         'brightness_for_off': 2,
     },
+    'zhimi.fan.fb1': {
+        'extend_miot_specs': [
+            {
+                'iid': 2,
+                'properties': [
+                    {'iid': 5, 'value-range': [30, 120, 30]},
+                    {'iid': 6, 'value-range': [30, 90, 30]},
+                ],
+            },
+            {
+                'iid': 5,
+                'properties': [
+                    {
+                        'iid': 6,
+                        'value-list': [
+                            {'value': 'left', 'description': 'Turn Left'},
+                            {'value': 'right', 'description': 'Turn Right'},
+                        ],
+                    },
+                    {
+                        'iid': 7,
+                        'value-list': [
+                            {'value': 'up', 'description': 'Turn Up'},
+                            {'value': 'down', 'description': 'Turn Down'},
+                        ],
+                    },
+                ],
+            },
+        ],
+        'switch_properties': 'alarm,horizontal_swing,vertical_swing,oscillating,h_swing_back,v_swing_back',
+        'number_properties': 'timing',
+        'percentage_property': 'stepless_fan_level',
+        'select_properties': 'mode,horizontal_angle,vertical_angle',
+        'button_properties': 'h_swing_step_move,v_swing_step_move'
+    },
     'zhimi.fan.za3': {
         'miot_type': 'urn:miot-spec-v2:device:fan:0000A005:zhimi-za3:3',
         'number_select_properties': 'fan_level',
@@ -1884,6 +1960,7 @@ DEVICE_CUSTOMIZES = {
         'number_select_properties': 'wash_mode,wash_time,target_water_level,water_level',
     },
     '*.fan.*': {
+        'button_actions': 'turn_left,turn_right',
         'number_properties': 'off_delay_time',
         'switch_properties': 'fan_init_power_opt',
     },
