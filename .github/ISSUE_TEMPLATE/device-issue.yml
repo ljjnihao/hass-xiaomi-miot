@@ -14,7 +14,7 @@ body:
   - type: input
     attributes:
       label: Component version / 插件版本
-      placeholder: 0.7.x
+      placeholder: 1.0.x
       description: |
         > [⚙️ Settings > System > Repairs > Three Dots in Upper Right > System information](https://my.home-assistant.io/redirect/system_health) > `Xiaomi Miot Auto`
         > [⚙️ 配置 > 系统 > 修复 > 右上角三个点 > 系统信息](https://my.home-assistant.io/redirect/system_health) > `Xiaomi Miot Auto`
@@ -49,8 +49,8 @@ body:
       label: Entity attributes / 实体属性
       render: yaml
       description: |
-        > [🔨 Developer tools > ℹ️ State](https://my.home-assistant.io/redirect/developer_states) > 🔍 Filter (Entity with most attributes)
-        > [🔨 开发者工具 > ℹ️ 状态](https://my.home-assistant.io/redirect/developer_states) > 🔍 筛选 (属性最多的实体)
+        > [🔨 Developer tools > ℹ️ State](https://my.home-assistant.io/redirect/developer_states) > 🔍 Filter (`button.xxxx_info`)
+        > [🔨 开发者工具 > ℹ️ 状态](https://my.home-assistant.io/redirect/developer_states) > 🔍 筛选该设备下的info实体
         > 如果没有实体，请填写`无实体`
 
   - type: textarea
@@ -59,3 +59,4 @@ body:
       description: |
         > [⚙️ Settings > System > ✍️ Logs](https://my.home-assistant.io/redirect/logs) > 🔍 Filter `miot`
         > [⚙️ 配置 > 系统 > ✍️ 日志](https://my.home-assistant.io/redirect/logs) > 🔍 筛选 `miot`
+        > [🐞 获取调试日志](https://github.com/al-one/hass-xiaomi-miot/issues/500#debug)

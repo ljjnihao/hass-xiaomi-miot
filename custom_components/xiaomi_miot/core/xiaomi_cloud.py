@@ -11,6 +11,7 @@ import micloud
 import requests
 from datetime import datetime
 from functools import partial
+from typing import Optional
 from urllib import parse
 
 from homeassistant.const import (
@@ -22,7 +23,7 @@ from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.components import persistent_notification
 
 from .const import DOMAIN, CONF_XIAOMI_CLOUD
-from .utils import RC4
+from .utils import RC4, logger_filter
 from micloud import miutils
 from micloud.micloudexception import MiCloudException
 
@@ -33,11 +34,15 @@ except (ModuleNotFoundError, ImportError):
         """ micloud==0.4 """
 
 _LOGGER = logging.getLogger(__name__)
+_LOGGER.addFilter(logger_filter)
+
 ACCOUNT_BASE = 'https://account.xiaomi.com'
 UA = "Android-7.1.1-1.0.0-ONEPLUS A3010-136-%s APP/xiaomi.smarthome APPV/62830"
 
 
 class MiotCloud(micloud.MiCloud):
+    async_session: Optional[aiohttp.ClientSession] = None
+
     def __init__(self, hass, username, password, country=None, sid=None):
         try:
             super().__init__(username, password)
@@ -54,7 +59,7 @@ class MiotCloud(micloud.MiCloud):
         self.useragent = UA % self.client_id
         self.http_timeout = int(hass.data[DOMAIN].get('config', {}).get('http_timeout') or 10)
         self.login_times = 0
-        self.async_session = None
+        self.cookies = {}
         self.attrs = {}
 
     @property
@@ -82,7 +87,7 @@ class MiotCloud(micloud.MiCloud):
             k = rmp.get(f'prop.{s}.{p}')
             if not k:
                 continue
-            v['did'] = k
+            v['prop'] = k
             dls.append(v)
         return dls
 
@@ -159,30 +164,44 @@ class MiotCloud(micloud.MiCloud):
         return vls.pop(0)
 
     async def async_check_auth(self, notify=False):
-        api = 'v2/message/v2/check_new_msg'
-        dat = {
-            'begin_at': int(time.time()) - 60,
-        }
+        if self.service_token:
+            api = 'v2/message/v2/check_new_msg'
+            dat = {
+                'begin_at': int(time.time()) - 60,
+            }
+            try:
+                rdt = await self.async_request_api(api, dat, method='POST') or {}
+                eno = rdt.get('code', 0)
+                msg = rdt.get('message', '')
+                if eno in [2, 3]:
+                    pass
+                elif 'auth err' in msg:
+                    pass
+                elif msg in ['invalid signature', 'SERVICETOKEN_EXPIRED']:
+                    pass
+                else:
+                    return True
+            except requests.exceptions.ConnectionError:
+                return None
+            except requests.exceptions.Timeout:
+                return None
+            # auth err
+            _LOGGER.info('Xiaomi auth failed, try relogin. %s', rdt)
+        nid = f'xiaomi-miot-auth-warning-{self.user_id}'
+        need_verify = None
         try:
-            rdt = await self.async_request_api(api, dat, method='POST') or {}
-            nid = f'xiaomi-miot-auth-warning-{self.user_id}'
-            eno = rdt.get('code', 0)
-            if eno != 3:
+            if await self.async_relogin():
+                persistent_notification.dismiss(self.hass, nid)
                 return True
-        except requests.exceptions.ConnectionError:
-            return None
-        except requests.exceptions.Timeout:
-            return None
-        # auth err
-        if await self.async_relogin():
-            persistent_notification.dismiss(self.hass, nid)
-            return True
+        except MiCloudNeedVerify as exc:
+            need_verify = exc
         if notify:
+            lnk = f'/config/integrations/integration/{DOMAIN}'
             persistent_notification.create(
                 self.hass,
                 f'Xiaomi account: {self.user_id} auth failed, '
-                'Please update option for this integration to refresh token.\n'
-                f'小米账号：{self.user_id} 登录失效，请重新保存集成选项以更新登录信息。',
+                f'Your Xiaomi account login status has expired, Please login again through [integrated configuration]({lnk}).\n'
+                f'你的小米账号登陆状态已失效，但本次需要手动验证，请通过[集成配置]({lnk})重新登陆。',
                 'Xiaomi Miot Warning',
                 nid,
             )
@@ -191,6 +210,8 @@ class MiotCloud(micloud.MiCloud):
                 self.user_id,
                 rdt,
             )
+        elif need_verify:
+            raise need_verify
         else:
             _LOGGER.warning('Retry login xiaomi account failed: %s', self.username)
         return False
@@ -294,20 +315,22 @@ class MiotCloud(micloud.MiCloud):
             'get_split_device': False,
             'support_smart_home': True,
         }, debug=False, timeout=60) or {}
-        if rdt and 'result' in rdt:
-            return rdt['result']['list']
+        result = rdt.get('result')
+        if result:
+            return result['list']
         _LOGGER.warning('Got xiaomi devices for %s failed: %s', self.username, rdt)
         return None
 
     async def get_all_devices(self, homes=None):
-        dvs = await self.get_device_list() or []
+        devices = {
+            d['did']: d
+            for d in await self.get_device_list() or []
+        }
         if not isinstance(homes, list):
-            return dvs
+            return await self.get_device_list() or []
         for home in homes:
             hid = int(home.get('id', 0))
             uid = int(home.get('uid', 0))
-            if not hid or uid == self.user_id:
-                continue
             start_did = ''
             has_more = True
             while has_more:
@@ -321,11 +344,15 @@ class MiotCloud(micloud.MiCloud):
                     'get_cariot_device': True,
                     'get_third_device': True,
                 }, debug=False, timeout=20) or {}
-                rdt = rdt.get('result') or {}
-                dvs.extend(rdt.get('device_info') or {})
-                start_did = rdt.get('max_did') or ''
-                has_more = rdt.get('has_more')
-        return dvs
+                result = rdt.get('result') or {}
+                if not result:
+                    _LOGGER.warning('Got xiaomi devices for %s failed: %s', self.username, rdt)
+                for d in result.get('device_info') or []:
+                    did = d.get('did')
+                    devices.setdefault(did, {}).update(d)
+                start_did = result.get('max_did') or ''
+                has_more = result.get('has_more') and start_did
+        return list(devices.values())
 
     async def get_home_devices(self):
         rdt = await self.async_request_api('v2/homeroom/gethome_merged', {
@@ -337,18 +364,20 @@ class MiotCloud(micloud.MiCloud):
             'app_ver': 7,
             'plat_form': 0,
         }, debug=False, timeout=60) or {}
-        rdt = rdt.get('result') or {}
-        rdt.setdefault('devices', {})
-        for h in rdt.get('homelist', []):
+        result = rdt.get('result') or {}
+        if not result:
+            _LOGGER.warning('Got xiaomi home devices for %s failed: %s', self.username, rdt)
+        devices = result.setdefault('devices', {})
+        for h in result.get('homelist', []):
             for r in h.get('roomlist', []):
                 for did in r.get('dids', []):
-                    rdt['devices'][did] = {
+                    devices[did] = {
                         'home_id': h.get('id'),
                         'room_id': r.get('id'),
                         'home_name': h.get('name'),
                         'room_name': r.get('name'),
                     }
-        return rdt
+        return result
 
     async def async_get_devices(self, renew=False, return_all=False):
         if not self.user_id:
@@ -433,9 +462,9 @@ class MiotCloud(micloud.MiCloud):
         return dat.get('homes') or []
 
     async def async_get_beaconkey(self, did):
-        dat = {'did': did or self.miot_did, 'pdid': 1}
+        dat = {'did': did, 'pdid': 1}
         rdt = await self.async_request_api('v2/device/blt_get_beaconkey', dat) or {}
-        return rdt.get('result')
+        return rdt.get('result', rdt)
 
     @staticmethod
     def is_hide(d):
@@ -448,17 +477,19 @@ class MiotCloud(micloud.MiCloud):
                 return True
         return False
 
-    async def async_login(self, captcha=None):
+    async def async_login(self, login_data=None):
+        if self.login_times > 5:
+            await self.async_stored_auth(remove=True)
         if self.login_times > 10:
             raise MiCloudException(
                 'Too many failures when login to Xiaomi, '
                 'please reload/config xiaomi_miot component.'
             )
         self.login_times += 1
-        ret = await self.hass.async_add_executor_job(self._login_request, captcha)
+        ret = await self.hass.async_add_executor_job(self._login_request, login_data)
         if ret:
             self.hass.data[DOMAIN]['sessions'][self.unique_id] = self
-            await self.async_stored_auth(self.user_id, save=True)
+            await self.async_stored_auth(save=True)
             self.login_times = 0
         return ret
 
@@ -468,15 +499,27 @@ class MiotCloud(micloud.MiCloud):
 
     def _logout(self):
         self.service_token = None
+        self.async_session = None
 
-    def _login_request(self, captcha=None):
+    def _login_request(self, login_data=None):
         self._init_session(True)
-        auth = self.attrs.pop('login_data', None)
-        if captcha and auth:
-            auth['captcha'] = captcha
-        if not auth:
+        location = ''
+        auth = self.attrs.pop('login_data', {})
+        if not login_data:
+            pass
+        elif ticket := login_data.get('verify_ticket'):
+            resp = self.verify_ticket(ticket)
+            location = resp.get('location', '')
+            if location:
+                self.account_get(location, allow_redirects=True)
+                auth = self._login_step1()
+                location = auth.get('location', '')
+        elif auth:
+            auth.update(login_data)
+        else:
             auth = self._login_step1()
-        location = self._login_step2(**auth)
+        if not location:
+            location = self._login_step2(**auth)
         response = self._login_step3(location)
         http_code = response.status_code
         if http_code == 200:
@@ -491,20 +534,25 @@ class MiotCloud(micloud.MiCloud):
             raise MiCloudException(f'Login to xiaomi error: {response.text} ({http_code})')
 
     def _login_step1(self):
-        response = self.session.get(
-            f'{ACCOUNT_BASE}/pass/serviceLogin',
-            params={'sid': self.sid, '_json': 'true'},
-            headers={'User-Agent': self.useragent},
-            cookies={'sdkVersion': '3.8.6', 'deviceId': self.client_id},
-        )
+        self.cookies.update({'sdkVersion': '3.8.6', 'deviceId': self.client_id})
         try:
-            auth = json.loads(response.text.replace('&&&START&&&', '')) or {}
+            auth = self.account_get(
+                '/pass/serviceLogin',
+                params={'sid': self.sid, '_json': 'true'},
+                headers={'User-Agent': self.useragent},
+            )
         except Exception as exc:
             raise MiCloudException(f'Error getting xiaomi login sign. Cannot parse response. {exc}')
+        if auth.get('code') == 0:
+            self.user_id = auth.get('userId', self.user_id)
+            self.cuser_id = auth.get('cUserId', self.cuser_id)
+            self.ssecurity = auth.get('ssecurity', self.ssecurity)
+            self.pass_token = auth.get('passToken', self.pass_token)
+            self.async_session = None
         return auth
 
-    def _login_step2(self, captcha=None, **kwargs):
-        url = f'{ACCOUNT_BASE}/pass/serviceLoginAuth2'
+    def _login_step2(self, **kwargs):
+        url = '/pass/serviceLoginAuth2'
         post = {
             'user': self.username,
             'hash': hashlib.md5(self.password.encode()).hexdigest().upper(),
@@ -514,34 +562,28 @@ class MiotCloud(micloud.MiCloud):
             '_sign': kwargs.get('_sign') or '',
         }
         params = {'_json': 'true'}
-        headers = {'User-Agent': self.useragent}
-        cookies = {'sdkVersion': '3.8.6', 'deviceId': self.client_id}
-        if captcha:
-            post['captCode'] = captcha
-            params['_dc'] = int(time.time() * 1000)
-            cookies['ick'] = self.attrs.pop('captchaIck', '')
-        response = self.session.post(url, data=post, params=params, headers=headers, cookies=cookies)
-        auth = json.loads(response.text.replace('&&&START&&&', '')) or {}
+        cookies = {}
+        response = self.account_post(url, data=post, params=params, cookies=cookies, response=True)
+        auth = self.json_decode(response.text) or {}
         code = auth.get('code')
         # 20003 InvalidUserNameException
         # 22009 PackageNameDeniedException
         # 70002 InvalidCredentialException
-        # 70016 InvalidCredentialException with captchaUrl
+        # 70016 InvalidCredentialException with captchaUrl / Password error
         # 81003 NeedVerificationException
         # 87001 InvalidResponseException captCode error
         # other NeedCaptchaException
         location = auth.get('location')
         if not location:
-            if cap := auth.get('captchaUrl'):
-                if cap[:4] != 'http':
-                    cap = f'{ACCOUNT_BASE}{cap}'
-                if self._get_captcha(cap):
-                    self.attrs['login_data'] = kwargs
             if ntf := auth.get('notificationUrl'):
                 if ntf[:4] != 'http':
                     ntf = f'{ACCOUNT_BASE}{ntf}'
-                self.attrs['notificationUrl'] = ntf
-            _LOGGER.error('Xiaomi serviceLoginAuth2: %s', [url, params, post, headers, cookies])
+                self.attrs['verify_url'] = ntf
+                raise MiCloudNeedVerify('need_verify').with_url(ntf)
+            _LOGGER.error(
+                'Xiaomi serviceLoginAuth2: %s' %
+                [url, self.login_times, {**post, 'hash': '*'}, cookies, response.text],
+            )
             raise MiCloudAccessDenied(f'Login to xiaomi error: {response.text}')
         self.user_id = str(auth.get('userId', ''))
         self.cuser_id = auth.get('cUserId')
@@ -552,35 +594,102 @@ class MiotCloud(micloud.MiCloud):
             sign = hashlib.sha1(sign.encode()).digest()
             sign = base64.b64encode(sign).decode()
             location += '&clientSign=' + parse.quote(sign)
-        _LOGGER.info('Xiaomi serviceLoginAuth2: %s', [auth, response.cookies.get_dict()])
+        _LOGGER.info('Xiaomi serviceLoginAuth2: %s', [auth, self.cookies])
         return location
 
     def _login_step3(self, location):
         self.session.headers.update({'content-type': 'application/x-www-form-urlencoded'})
-        response = self.session.get(
-            location,
-            headers={'User-Agent': self.useragent},
-            cookies={'sdkVersion': '3.8.6', 'deviceId': self.client_id},
-        )
-        service_token = response.cookies.get('serviceToken')
+        response = self.account_get(location, response=True)
+        cookies = response.cookies
+        service_token = cookies.get('serviceToken')
         if service_token:
             self.service_token = service_token
+            self.user_id = cookies.get('userId', self.user_id)
+            self.cuser_id = cookies.get('cUserId', self.cuser_id)
+            self.async_session = None
         else:
             err = {
                 'location': location,
                 'status_code': response.status_code,
-                'cookies': response.cookies.get_dict(),
+                'cookies': cookies.get_dict(),
                 'response': response.text,
             }
             raise MiCloudAccessDenied(f'Login to xiaomi error: {err}')
         return response
 
-    def _get_captcha(self, url):
-        response = self.session.get(url)
-        if ick := response.cookies.get('ick'):
-            self.attrs['captchaIck'] = ick
-            self.attrs['captchaImg'] = base64.b64encode(response.content).decode()
-        return response
+    def check_identity_list(self, url, path='identity/authStart'):
+        if path not in url:
+            return None
+        resp = self.account_get(url.replace(path, 'identity/list'), response=True)
+        identity_session = resp.cookies.get('identity_session')
+        if not identity_session:
+            return False
+        data = self.json_decode(resp.text) or {}
+        flag = data.get('flag', 4)
+        options = data.get('options', [flag])
+        return options
+
+    def verify_ticket(self, ticket):
+        url = self.attrs.get('verify_url')
+        if not url:
+            return {}
+        options = self.check_identity_list(url) or []
+        for flag in options:
+            api = {
+                4: '/identity/auth/verifyPhone',
+                8: '/identity/auth/verifyEmail',
+            }.get(flag)
+            if not api:
+                continue
+            data = self.account_post(
+                api,
+                params={
+                    '_dc': int(time.time() * 1000),
+                },
+                data={
+                    '_flag': flag,
+                    'ticket': ticket,
+                    'trust': 'true',
+                    '_json': 'true',
+                },
+                cookies={
+                    'identity_session': self.attrs.get('identity_session'),
+                },
+            )
+            if data.get('code') == 0:
+                self.attrs.pop('identity_session', None)
+                return data
+        return {}
+
+    def account_get(self, url, method='GET', **kwargs):
+        return self.account_post(url, method, **kwargs)
+
+    def account_post(self, url, method='POST', **kwargs):
+        if url[:4] != 'http':
+            url = f'{ACCOUNT_BASE}{url}'
+        kwargs['cookies'] = {
+            **self.cookies,
+            **kwargs.get('cookies', {}),
+        }
+        kwargs.setdefault('headers', {'User-Agent': self.useragent})
+        response = kwargs.pop('response', None)
+        resp = self.session.request(method, url, **kwargs)
+        try:
+            data = self.json_decode(resp.text) or {}
+        except Exception:
+            data = {
+                'code': resp.status_code,
+                'response': resp.text,
+            }
+        self.cookies.update(resp.cookies.get_dict())
+        log = _LOGGER.warning if data.get('code') else _LOGGER.info
+        log('Account request: %s' % [url, kwargs, resp.text])
+        if response:
+            return resp
+        return data
+
+    def json_decode(self, text):
+        return json.loads(text.replace('&&&START&&&', ''))
 
     def to_config(self):
         return {
@@ -596,7 +705,8 @@ class MiotCloud(micloud.MiCloud):
 
     @staticmethod
     async def from_token(hass, config: dict, login=None):
-        mic = MiotCloud(
+        mic = await hass.async_add_executor_job(
+            MiotCloud,
             hass,
             config.get(CONF_USERNAME),
             config.get(CONF_PASSWORD),
@@ -606,12 +716,9 @@ class MiotCloud(micloud.MiCloud):
         mic.user_id = str(config.get('user_id') or '')
         if a := hass.data[DOMAIN].get('sessions', {}).get(mic.unique_id):
             mic = a
-            mic.async_session = None
-            if mic.password != config.get(CONF_PASSWORD):
-                mic.password = config.get(CONF_PASSWORD)
-                mic.service_token = None
+            mic.merger_config(config)
         if not mic.service_token:
-            sdt = await mic.async_stored_auth(mic.user_id, save=False)
+            sdt = await mic.async_stored_auth(save=False)
             config.update(sdt)
             mic.service_token = config.get('service_token')
             mic.ssecurity = config.get('ssecurity')
@@ -628,22 +735,45 @@ class MiotCloud(micloud.MiCloud):
             hass.data[DOMAIN]['sessions'][mic.unique_id] = mic
         return mic
 
+    def merger_config(self, config: dict, changed=None):
+        if self.username != config.get(CONF_USERNAME):
+            self.username = config.get(CONF_USERNAME)
+            changed = True
+        if self.password != config.get(CONF_PASSWORD):
+            self.password = config.get(CONF_PASSWORD)
+            changed = True
+        if changed:
+            self.async_session = None
+            self.service_token = None
+            self.ssecurity = None
+            self.cookies = {}
+            self.attrs = {}
+        return self
+
     async def async_change_sid(self, sid: str, login=None):
-        config = {**self.to_config(), 'sid': sid}
+        config = {
+            **self.to_config(),
+            'sid': sid,
+            'service_token': None,
+            'ssecurity': None,
+        }
         mic = await self.from_token(self.hass, config, login)
         return mic
 
-    async def async_stored_auth(self, uid=None, save=False):
-        if uid is None:
+    async def async_stored_auth(self, uid=None, save=False, remove=False):
+        if not uid:
             uid = self.user_id or self.username
         fnm = f'xiaomi_miot/auth-{uid}-{self.default_server}.json'
         if self.sid != 'xiaomiio':
-            fnm = f'xiaomi_miot/auth-{uid}-{self.default_server}-{self.sid}.json'
+            fnm = fnm.replace('.json', f'-{self.sid}.json')
         store = Store(self.hass, 1, fnm)
+        if remove:
+            await store.async_remove()
         try:
             old = await store.async_load() or {}
         except ValueError:
-            await store.async_remove()
+            if not remove:
+                await store.async_remove()
             old = {}
         if save:
             cfg = self.to_config()
@@ -661,7 +791,8 @@ class MiotCloud(micloud.MiCloud):
             raise MiCloudException('Cannot execute request. service token or userId missing. Make sure to login.')
 
         if kwargs.get('async'):
-            if not (session := self.async_session):
+            session = self.async_session
+            if not session or session.closed:
                 session = async_create_clientsession(
                     self.hass,
                     headers=self.api_headers(),
@@ -856,3 +987,11 @@ class MiotCloud(micloud.MiCloud):
     def get_random_string(length):
         seq = string.ascii_uppercase + string.digits
         return ''.join((random.choice(seq) for _ in range(length)))
+
+
+class MiCloudNeedVerify(MiCloudException):
+    url = None
+
+    def with_url(self, url):
+        self.url = url
+        return self
